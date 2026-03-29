@@ -15,7 +15,7 @@ handlers:
     class: logging.FileHandler
     level: DEBUG
     formatter: standard
-    filename: sam-cli-gateway.log
+    filename: sam-cli-entrypoint.log
 
 root:
   level: DEBUG

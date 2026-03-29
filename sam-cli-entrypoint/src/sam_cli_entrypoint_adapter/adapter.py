@@ -1,5 +1,5 @@
 """
-CLI Gateway Adapter for the Solace Agent Mesh Generic Gateway Framework.
+CLI Entrypoint Adapter for the Solace Agent Mesh Generic Entrypoint Framework.
 
 Provides an interactive terminal REPL for conversing with SAM agents.
 """
@@ -12,11 +12,12 @@ import shlex
 import signal
 import sys
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 from prompt_toolkit import PromptSession, prompt as pt_prompt
-from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.completion import Completer, Completion, WordCompleter
 from prompt_toolkit.shortcuts import checkboxlist_dialog
 from rich.console import Console
 from rich.markdown import Markdown
@@ -35,6 +36,8 @@ from solace_agent_mesh.gateway.adapter.types import (
     SamTextPart,
 )
 
+from sam_cli_entrypoint_adapter.session_store import SessionStore
+
 # Max upload size: 50 MB (matches SAM default gateway_max_upload_size_bytes)
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
@@ -48,11 +51,11 @@ _RESET = "\033[0m"
 BANNER = (
     _BOLD + _SOLACE_GREEN
     + r"""
-  ____    _    __  __    ____ _     ___    ____    _  _____ _______        ___ __   __
- / ___|  / \  |  \/  |  / ___| |   |_ _|  / ___|  / \|_   _| ____\ \      / / \\ \ / /
- \___ \ / _ \ | |\/| | | |   | |    | |  | |  _  / _ \ | | |  _|  \ \ /\ / / _ \\ V /
-  ___) / ___ \| |  | | | |___| |___ | |  | |_| |/ ___ \| | | |___  \ V  V / ___ \| |
- |____/_/   \_\_|  |_|  \____|_____|___|  \____/_/   \_\_| |_____|  \_/\_/_/   \_\_|
+ ____    _    __  __    ____ _     ___   _____ _   _ _____ ______   ______   ___ ___ _   _ _____
+/ ___|  / \  |  \/  |  / ___| |   |_ _| | ____| \ | |_   _|  _ \ \ / /  _ \ / _ \_ _| \ | |_   _|
+\___ \ / _ \ | |\/| | | |   | |    | |  |  _| |  \| | | | | |_) \ V /| |_) | | | | ||  \| | | |
+ ___) / ___ \| |  | | | |___| |___ | |  | |___| |\  | | | |  _ < | | |  __/| |_| | || |\  | | |
+|____/_/   \_\_|  |_|  \____|_____|___| |_____|_| \_| |_| |_| \_\|_| |_|    \___/___|_| \_| |_|
 """
     + _RESET
 )
@@ -69,10 +72,37 @@ _console = Console(theme=_solace_theme, highlight=False)
 
 # Slash command auto-completion
 _COMMANDS = [
-    "/new", "/agents", "/upload", "/artifacts", "/download",
+    "/new", "/sessions", "/switch", "/rename", "/delete",
+    "/agents", "/upload", "/artifacts", "/download",
     "/feedback", "/help", "/quit", "/exit",
 ]
-_command_completer = WordCompleter(_COMMANDS, sentence=True)
+
+# Commands whose first argument should complete with session labels
+_SESSION_ARG_COMMANDS = {"/switch", "/delete"}
+
+
+class _CliCompleter(Completer):
+    """Dynamic completer: command names first, then session labels for /switch and /delete."""
+
+    def __init__(self):
+        self._session_store: Optional[SessionStore] = None
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor.lstrip()
+        # First token — complete command names
+        if " " not in text:
+            for cmd in _COMMANDS:
+                if cmd.startswith(text):
+                    yield Completion(cmd, start_position=-len(text))
+            return
+        # Second token — complete session labels for applicable commands
+        cmd, _, partial = text.partition(" ")
+        partial = partial.lstrip()
+        if cmd in _SESSION_ARG_COMMANDS and self._session_store:
+            for session in self._session_store.list_sessions():
+                label = session.get("label")
+                if label and label.startswith(partial):
+                    yield Completion(label, start_position=-len(partial))
 
 
 class CliAdapterConfig(BaseModel):
@@ -83,7 +113,7 @@ class CliAdapterConfig(BaseModel):
         description="The prompt string shown in the REPL.",
     )
     user_id: str = Field(
-        "cli_gateway_user",
+        "cli_entrypoint_user",
         description="User identity for this CLI session.",
     )
     show_status_updates: bool = Field(
@@ -92,8 +122,8 @@ class CliAdapterConfig(BaseModel):
     )
 
 
-class CliGatewayAdapter(GatewayAdapter):
-    """A terminal-based gateway adapter for Solace Agent Mesh."""
+class CliEntrypointAdapter(GatewayAdapter):
+    """A terminal-based entrypoint adapter for Solace Agent Mesh."""
 
     ConfigModel = CliAdapterConfig
 
@@ -110,23 +140,39 @@ class CliGatewayAdapter(GatewayAdapter):
         self._last_session_id: Optional[str] = None
         # Prompt session with auto-completion
         self._prompt_session: Optional[PromptSession] = None
+        # Session management
+        self._session_store: Optional[SessionStore] = None
 
     async def init(self, context: GatewayContext) -> None:
         """Initialize the CLI adapter and start the stdin reader loop."""
         self.context = context
         self.config = context.adapter_config
-        log.info("Initializing CLI Gateway Adapter...")
+        log.info("Initializing CLI Entrypoint Adapter...")
 
         self._response_event = asyncio.Event()
+
+        # Initialize session store and ensure a default session exists
+        self._session_store = SessionStore(entrypoint_id=context.gateway_id)
+        default_id = self._default_session_id()
+        if not self._session_store.get(default_id):
+            self._session_store.create(default_id, label="default")
+        # Restore or set active session (validate it still exists)
+        stored_active = self._session_store.active_session
+        if not stored_active or not self._session_store.get(stored_active):
+            self._session_store.active_session = default_id
+
+        active_id = self._session_store.active_session
+        active_meta = self._session_store.get(active_id) or {}
+        active_label = active_meta.get("label") or active_id
 
         # Print banner
         g = _SOLACE_GREEN
         r = _RESET
         print(BANNER)
-        print(f"  {g}Gateway ID:{r}    {context.gateway_id}")
+        print(f"  {g}Entrypoint ID:{r}  {context.gateway_id}")
         print(f"  {g}Namespace:{r}     {context.namespace}")
         print(f"  {g}User:{r}          {self.config.user_id}")
-        print(f"  {g}Session:{r}       {self._default_session_id()}")
+        print(f"  {g}Session:{r}       {active_label}")
         print()
         print(f"  Type a message to chat with SAM agents.")
         print(f"  Type {g}/help{r} for available commands.")
@@ -134,7 +180,7 @@ class CliGatewayAdapter(GatewayAdapter):
 
         # Start the interactive REPL as a background task
         self._reader_task = asyncio.create_task(self._repl_loop())
-        log.info("CLI Gateway Adapter initialized.")
+        log.info("CLI Entrypoint Adapter initialized.")
 
     async def cleanup(self) -> None:
         """Clean up the reader task on shutdown."""
@@ -144,7 +190,7 @@ class CliGatewayAdapter(GatewayAdapter):
                 await self._reader_task
             except asyncio.CancelledError:
                 pass
-        log.info("CLI Gateway Adapter shut down.")
+        log.info("CLI Entrypoint Adapter shut down.")
 
     # --- Authentication ---
 
@@ -250,7 +296,7 @@ class CliGatewayAdapter(GatewayAdapter):
         """Generate a deterministic session ID for the default session.
 
         Format: {gateway_id}__default
-        This ensures the same user reconnecting to the same gateway resumes
+        This ensures the same user reconnecting to the same entrypoint resumes
         their prior conversation and artifacts.
         """
         return f"{self.context.gateway_id}__default"
@@ -259,20 +305,22 @@ class CliGatewayAdapter(GatewayAdapter):
         """Generate a new unique session ID, prefixed with gateway_id.
 
         Format: {gateway_id}__cli-{random}
-        All sessions from this gateway are visually grouped in artifact storage.
+        All sessions from this entrypoint are visually grouped in artifact storage.
         """
         return f"{self.context.gateway_id}__cli-{uuid.uuid4().hex[:8]}"
 
     async def _repl_loop(self) -> None:
         """Run the interactive read-eval-print loop."""
-        session_id = self._default_session_id()
+        session_id = self._session_store.active_session or self._default_session_id()
         loop = asyncio.get_running_loop()
 
-        # Initialize prompt_toolkit session with auto-completion
+        # Initialize prompt_toolkit session with dynamic auto-completion
         prompt_str = self.config.prompt if self.config else "sam> "
+        completer = _CliCompleter()
+        completer._session_store = self._session_store
         self._prompt_session = PromptSession(
             message=prompt_str,
-            completer=_command_completer,
+            completer=completer,
             complete_while_typing=True,
         )
 
@@ -294,6 +342,7 @@ class CliGatewayAdapter(GatewayAdapter):
                         break
                     if isinstance(result, str) and result.startswith("new_session:"):
                         session_id = result.split(":", 1)[1]
+                        self._session_store.active_session = session_id
                     continue
 
                 # Catch bare exit/quit and offer the real command
@@ -322,6 +371,7 @@ class CliGatewayAdapter(GatewayAdapter):
                 try:
                     task_id = await self.context.handle_external_input(event)
                     self._current_task_id = task_id
+                    self._session_store.increment_message_count(session_id)
                 except Exception as e:
                     print(f"\n\033[91m  Error submitting task: {e}\033[0m\n")
                     continue
@@ -364,7 +414,19 @@ class CliGatewayAdapter(GatewayAdapter):
             return "exit"
 
         elif cmd == "/new":
-            return await self._cmd_new(loop=asyncio.get_running_loop())
+            return self._cmd_new(args, session_id)
+
+        elif cmd == "/sessions":
+            self._cmd_sessions(session_id)
+
+        elif cmd == "/switch":
+            return self._cmd_switch(args, session_id)
+
+        elif cmd == "/rename":
+            self._cmd_rename(args, session_id)
+
+        elif cmd == "/delete":
+            self._cmd_delete(args, session_id)
 
         elif cmd == "/agents":
             await self._cmd_agents()
@@ -391,20 +453,139 @@ class CliGatewayAdapter(GatewayAdapter):
 
     # --- Command Implementations ---
 
-    async def _cmd_new(self, loop: asyncio.AbstractEventLoop) -> Optional[str]:
-        """Start a new session with confirmation."""
-        print("\033[93m  Warning: Starting a new session will start a fresh conversation.")
-        print("  You will lose access to current conversation history and artifacts.\033[0m")
-        confirm = await loop.run_in_executor(
-            None, lambda: pt_prompt("  Continue? (y/n): ")
-        )
-        if confirm.strip().lower() in ("y", "yes"):
-            new_id = self._new_session_id()
-            print(f"\033[92m  New session started: {new_id}\033[0m\n")
-            return f"new_session:{new_id}"
-        else:
-            print("  Cancelled.\n")
+    def _cmd_new(self, args: List[str], current_session_id: str) -> Optional[str]:
+        """Start a new session, optionally with a label."""
+        label = args[0] if args else None
+
+        # Enforce unique labels
+        if label and self._session_store.label_exists(label):
+            print(f"\033[93m  A session with label \"{label}\" already exists. Use /switch {label} or pick a different name.\033[0m\n")
             return None
+
+        new_id = self._new_session_id()
+        self._session_store.create(new_id, label=label)
+        display = label or new_id
+        print(f"\033[92m  New session started: {display}\033[0m\n")
+        return f"new_session:{new_id}"
+
+    def _cmd_sessions(self, current_session_id: str) -> None:
+        """List all sessions."""
+        sessions = self._session_store.list_sessions()
+        if not sessions:
+            print("\n  No sessions.\n")
+            return
+
+        print()
+        for s in sessions:
+            sid = s["id"]
+            label = s.get("label")
+            count = s.get("message_count", 0)
+            last = s.get("last_active", "")
+            # Show relative time if possible
+            age = self._format_age(last)
+
+            marker = "*" if sid == current_session_id else " "
+            if label:
+                print(f"  {marker} {_BOLD}{label}{_RESET}  ({count} msgs, {age})")
+            else:
+                # Show short ID suffix for unnamed sessions
+                short_id = sid.split("__")[-1] if "__" in sid else sid[-12:]
+                print(f"  {marker} {short_id}  ({count} msgs, {age})")
+        print()
+
+    def _cmd_switch(self, args: List[str], current_session_id: str) -> Optional[str]:
+        """Switch to an existing session by label or ID."""
+        if not args:
+            print("\033[93m  Usage: /switch <label|id>\033[0m\n")
+            return None
+
+        target = args[0]
+        try:
+            session_id = self._session_store.resolve(target)
+        except ValueError as e:
+            print(f"\033[93m  {e}\033[0m\n")
+            return None
+        if not session_id:
+            print(f"\033[93m  No session found matching \"{target}\". Use /sessions to list.\033[0m\n")
+            return None
+
+        if session_id == current_session_id:
+            print("\033[93m  Already in that session.\033[0m\n")
+            return None
+
+        meta = self._session_store.get(session_id) or {}
+        display = meta.get("label") or session_id
+        count = meta.get("message_count", 0)
+        print(f"\033[92m  Switched to: {display} ({count} msgs)\033[0m\n")
+        return f"new_session:{session_id}"
+
+    def _cmd_rename(self, args: List[str], current_session_id: str) -> None:
+        """Rename the current session."""
+        if not args:
+            print("\033[93m  Usage: /rename <new-label>\033[0m\n")
+            return
+
+        new_label = args[0]
+        if self._session_store.label_exists(new_label):
+            print(f"\033[93m  A session with label \"{new_label}\" already exists.\033[0m\n")
+            return
+
+        self._session_store.update(current_session_id, label=new_label)
+        print(f"\033[92m  Current session renamed to: {new_label}\033[0m\n")
+
+    def _cmd_delete(self, args: List[str], current_session_id: str) -> None:
+        """Delete a session from the local index."""
+        if not args:
+            print("\033[93m  Usage: /delete <label|id>\033[0m\n")
+            return
+
+        target = args[0]
+        try:
+            session_id = self._session_store.resolve(target)
+        except ValueError as e:
+            print(f"\033[93m  {e}\033[0m\n")
+            return
+        if not session_id:
+            print(f"\033[93m  No session found matching \"{target}\".\033[0m\n")
+            return
+
+        if session_id == current_session_id:
+            print("\033[93m  Cannot delete the active session. Switch to another session first.\033[0m\n")
+            return
+
+        if session_id == self._default_session_id():
+            print("\033[93m  Cannot delete the default session.\033[0m\n")
+            return
+
+        meta = self._session_store.get(session_id) or {}
+        display = meta.get("label") or session_id
+        self._session_store.delete(session_id)
+        print(f"\033[92m  Removed session \"{display}\" from local index.\033[0m")
+        print(f"\033[90m  Note: Conversation history and artifacts remain on SAM's side.\033[0m\n")
+
+    @staticmethod
+    def _format_age(iso_timestamp: str) -> str:
+        """Format an ISO timestamp as a human-readable relative age."""
+        if not iso_timestamp:
+            return "unknown"
+        try:
+            then = datetime.fromisoformat(iso_timestamp)
+            now = datetime.now(timezone.utc)
+            delta = now - then
+            seconds = int(delta.total_seconds())
+            if seconds < 60:
+                return "just now"
+            elif seconds < 3600:
+                m = seconds // 60
+                return f"{m}m ago"
+            elif seconds < 86400:
+                h = seconds // 3600
+                return f"{h}h ago"
+            else:
+                d = seconds // 86400
+                return f"{d}d ago"
+        except (ValueError, TypeError):
+            return "unknown"
 
     async def _cmd_agents(self) -> None:
         """List registered agents."""
@@ -480,6 +661,7 @@ class CliGatewayAdapter(GatewayAdapter):
         try:
             task_id = await self.context.handle_external_input(event)
             self._current_task_id = task_id
+            self._session_store.increment_message_count(session_id)
         except Exception as e:
             print(f"\033[91m  Error uploading: {e}\033[0m\n")
             return
@@ -634,8 +816,8 @@ class CliGatewayAdapter(GatewayAdapter):
         """Shut down the CLI and signal SAM to exit gracefully.
 
         Note: This sends SIGTERM to the entire SAM process, which will shut down
-        all gateways running in the same config. The CLI gateway is designed to be
-        run as the sole gateway in its own `sam run config.yaml` process.
+        all entrypoints running in the same config. The CLI entrypoint is designed to be
+        run as the sole entrypoint in its own `sam run config.yaml` process.
         """
         print(message)
         log.info("CLI exit requested, scheduling SIGTERM for graceful shutdown.")
@@ -651,8 +833,14 @@ class CliGatewayAdapter(GatewayAdapter):
         print("  \033[1mChat\033[0m")
         print("    Just type a message to chat with SAM agents.")
         print()
+        print("  \033[1mSessions\033[0m")
+        print("    /new [label]                — Start a new session (optionally named)")
+        print("    /sessions                   — List all sessions")
+        print("    /switch <label|id>          — Switch to an existing session")
+        print("    /rename <label>             — Rename the current session")
+        print("    /delete <label|id>          — Remove a session from local index (history stays on SAM)")
+        print()
         print("  \033[1mCommands\033[0m")
-        print("    /new                        — Start a new conversation session")
         print("    /agents                     — List registered agents")
         print("    /upload <file> [message]    — Send a file to an agent")
         print("    /artifacts                  — List agent-created files in this session")
