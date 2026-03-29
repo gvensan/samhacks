@@ -157,15 +157,13 @@ sam-cli-entrypoint/
 │   ├── adapter.py                   # CliEntrypointAdapter — REPL, commands, response handlers
 │   └── session_store.py             # SessionStore — local session index persistence
 ├── config.yaml                      # SAM-compliant entrypoint config
+├── logging.yaml                     # Logging configuration
 ├── pyproject.toml                   # Python package metadata (type=gateway in framework terms)
 ├── .env.example                     # Environment variable template
 ├── .gitignore
 ├── README.md                        # Setup & usage instructions
-├── APPROACH.md                      # This file
-└── SESSIONS-CONTEXT-ENHANCEMENT.md  # Original design doc (historical — see note below)
+└── APPROACH.md                      # This file
 ```
-
-> **Note:** `SESSIONS-CONTEXT-ENHANCEMENT.md` is the original design document that explored both session management and context compaction. The implementation dropped compaction — SAM's server-side session history makes it unnecessary. The doc remains as historical context for the design decisions.
 
 ## How to Run
 
