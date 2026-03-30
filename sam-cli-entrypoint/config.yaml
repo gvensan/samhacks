@@ -14,7 +14,7 @@
 log:
   stdout_log_level: ERROR
   log_file_level: DEBUG
-  log_file: sam-cli-entrypoint.log
+  log_file: logs/sam-cli-entrypoint.log
 
 # To use the `shared_config.yaml` file, uncomment the following line and remove the `shared_config` section below.
 # !include ../shared_config.yaml
@@ -22,7 +22,7 @@ log:
 shared_config:
   - broker_connection: &broker_connection
       dev_mode: ${SOLACE_DEV_MODE, false}
-      broker_url: ${SOLACE_BROKER_URL, ws://localhost:8080}
+      broker_url: ${SOLACE_BROKER_URL, ws://localhost:8008}
       broker_username: ${SOLACE_BROKER_USERNAME, default}
       broker_password: ${SOLACE_BROKER_PASSWORD, default}
       broker_vpn: ${SOLACE_BROKER_VPN, default}

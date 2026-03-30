@@ -58,7 +58,6 @@ CLI_ENTRYPOINT_ID=sam-cli-ep-02 sam run config.yaml  # second terminal
 - **Multi-session support** — create, name, switch between, and manage multiple concurrent sessions that persist across restarts
 - **File upload** to send local files to agents for analysis
 - **Artifact management** to list and download agent-created files (scoped per session)
-- **Feedback** to rate agent responses (published to Solace Agent Mesh's feedback topic)
 - **Graceful exit** via `/quit` or Ctrl+D
 
 ## REPL Commands
@@ -81,7 +80,6 @@ CLI_ENTRYPOINT_ID=sam-cli-ep-02 sam run config.yaml  # second terminal
 | `/upload <file> [message]` | Send a file to an agent |
 | `/artifacts` | List agent-created files in this session |
 | `/download [file] [path]` | Save artifacts (interactive multi-select if no file given) |
-| `/feedback up\|down [comment]` | Rate the last response |
 | `/help` | Show available commands |
 | `/quit` | Exit the CLI |
 

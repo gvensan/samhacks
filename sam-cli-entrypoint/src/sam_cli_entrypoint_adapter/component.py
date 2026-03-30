@@ -75,7 +75,8 @@ _console = Console(theme=_solace_theme, highlight=False)
 _COMMANDS = [
     "/new", "/sessions", "/switch", "/rename", "/delete",
     "/agents", "/upload", "/artifacts", "/download",
-    "/feedback", "/help", "/quit", "/exit",
+    "/help", "/quit", "/exit",
+    # TODO: Re-enable /feedback when BaseGatewayComponent exposes a feedback API
 ]
 
 # Commands whose first argument should complete with session labels
@@ -194,7 +195,7 @@ class CliEntrypointComponent(BaseGatewayComponent):
         """
         log.info("%s Stopping CLI listener...", self.log_identifier)
 
-    def _translate_external_input(
+    async def _translate_external_input(
         self, external_event: Any
     ) -> Tuple[str, List[A2APart], Dict[str, Any]]:
         """Convert CLI input dict to A2A parts and context."""
@@ -239,10 +240,13 @@ class CliEntrypointComponent(BaseGatewayComponent):
                     elif isinstance(part, DataPart) and part.data:
                         # Status updates (agent progress)
                         data = part.data
-                        if isinstance(data, dict) and data.get("type") == "agent_status":
-                            status_text = data.get("text", "")
-                            if self._show_status_updates and status_text:
-                                print(f"\r\033[90m  [{status_text}]\033[0m", end="", flush=True)
+                        if isinstance(data, dict):
+                            # Handle both formats: SAM's agent_progress_update and legacy agent_status
+                            data_type = data.get("type", "")
+                            if data_type in ("agent_progress_update", "agent_status"):
+                                status_text = data.get("status_text") or data.get("text", "")
+                                if self._show_status_updates and status_text:
+                                    print(f"\n\033[90m  [{status_text}]\033[0m", end="", flush=True)
 
         elif isinstance(event_data, TaskArtifactUpdateEvent):
             # File artifact notification
@@ -380,7 +384,7 @@ class CliEntrypointComponent(BaseGatewayComponent):
                         continue
 
                     # Translate input
-                    target_agent, a2a_parts, ext_ctx = self._translate_external_input(external_event)
+                    target_agent, a2a_parts, ext_ctx = await self._translate_external_input(external_event)
 
                     # Submit task
                     task_id = await self.submit_a2a_task(
@@ -461,8 +465,9 @@ class CliEntrypointComponent(BaseGatewayComponent):
         elif cmd == "/download":
             await self._cmd_download(args, session_id)
 
-        elif cmd == "/feedback":
-            await self._cmd_feedback(args, session_id)
+        # TODO: Re-enable /feedback when BaseGatewayComponent exposes a feedback API
+        # elif cmd == "/feedback":
+        #     await self._cmd_feedback(args, session_id)
 
         elif cmd == "/help":
             self._cmd_help()
@@ -876,7 +881,6 @@ class CliEntrypointComponent(BaseGatewayComponent):
         print("    /upload <file> [message]    — Send a file to an agent")
         print("    /artifacts                  — List agent-created files in this session")
         print("    /download [file] [path]     — Save artifacts (interactive if no file given)")
-        print("    /feedback up|down [comment] — Rate the last response")
         print("    /help                       — Show this help message")
         print("    /quit                       — Exit the CLI")
         print()

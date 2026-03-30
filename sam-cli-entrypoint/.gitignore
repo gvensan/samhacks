@@ -5,6 +5,7 @@ dist/
 build/
 .env
 *.log
+logs/
 .venv/
 .sam/
 .claude/

@@ -12,10 +12,12 @@ handlers:
     formatter: standard
     stream: ext://sys.stderr
   file:
-    class: logging.FileHandler
+    class: sam_cli_entrypoint_adapter.logging_utils.MkdirRotatingFileHandler
     level: DEBUG
     formatter: standard
-    filename: sam-cli-entrypoint.log
+    filename: logs/sam-cli-entrypoint.log
+    maxBytes: 52428800  # 50 MB
+    backupCount: 3
 
 root:
   level: DEBUG

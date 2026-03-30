@@ -158,9 +158,10 @@ sam-cli-entrypoint/
 │   ├── __init__.py
 │   ├── app.py                       # CliEntrypointApp — Gateway app wrapper
 │   ├── component.py                 # CliEntrypointComponent — REPL, commands, response handlers
+│   ├── logging_utils.py             # MkdirRotatingFileHandler — log rotation with auto-mkdir
 │   └── session_store.py             # SessionStore — local session index persistence
-├── config.yaml                      # Solace Agent Mesh-compliant entrypoint config
-├── logging.yaml                     # Logging configuration
+├── config.yaml                      # Solace Agent Mesh entrypoint config
+├── logging.yaml                     # Log rotation config (50MB, 3 backups)
 ├── pyproject.toml                   # Python package metadata (type=gateway in framework terms)
 ├── .env.example                     # Environment variable template
 ├── .gitignore
