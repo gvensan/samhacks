@@ -190,4 +190,3 @@ By studying the existing entrypoint implementations (WebUI HTTP/SSE) in `solace-
 
 This meant the terminal is treated as just another platform — no different from Slack or a REST API from Solace Agent Mesh's perspective. The component translates stdin to A2A parts on the way in, and renders agent responses as styled markdown on the way out — fully compliant with Solace Agent Mesh conventions, installable as a pip package, and runnable via `sam run config.yaml` like any other Solace Agent Mesh plugin.
 
-Built with **Claude Code** (Anthropic's agentic coding CLI).
