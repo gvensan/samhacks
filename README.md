@@ -1,21 +1,21 @@
-# SAM Hacks
+# Solace Agent Mesh - Plugins
 
-Hackathon projects for [Solace Agent Mesh](https://github.com/SolaceLabs/solace-agent-mesh) (SAM) — exploring custom entrypoints and agents.
+Project for [Solace Agent Mesh](https://github.com/SolaceLabs/solace-agent-mesh) — exploring custom entrypoints and agents.
 
 ## Projects
 
-### [SAM CLI Entrypoint](sam-cli-gateway/)
+### [Solace Agent Mesh CLI Entrypoint](sam-cli-entrypoint/)
 
-A terminal-based entrypoint adapter for SAM. Chat with agents directly from the command line with multi-session support, file uploads, artifact management, and markdown rendering.
+A terminal-based entrypoint for Solace Agent Mesh. Chat with agents directly from the command line with multi-session support, file uploads, artifact management, and markdown rendering.
 
 **Key docs:**
-- [README](sam-cli-gateway/README.md) — Setup and usage
-- [Approach & Architecture](sam-cli-gateway/APPROACH.md) — Design decisions and how it fits into SAM
+- [README](sam-cli-entrypoint/README.md) — Setup and usage
+- [Approach & Architecture](sam-cli-entrypoint/APPROACH.md) — Design decisions and architecture
 
 ## Quick Start
 
 ```bash
-cd sam-cli-gateway
+cd sam-cli-entrypoint
 pip install -e .
 cp .env.example .env   # edit with your broker details
 sam run config.yaml
