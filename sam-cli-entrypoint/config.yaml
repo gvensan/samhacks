@@ -36,16 +36,13 @@ shared_config:
 
 apps:
   - name: sam_cli_entrypoint_app
-    app_module: solace_agent_mesh.gateway.generic.app
+    app_module: sam_cli_entrypoint_adapter.app
     broker:
       <<: *broker_connection
 
     app_config:
       # --- Required ---
       namespace: "${NAMESPACE}"
-
-      # --- Generic Adapter Framework Config ---
-      gateway_adapter: sam_cli_entrypoint_adapter.adapter.CliEntrypointAdapter
 
       # --- CLI Adapter-Specific Config ---
       adapter_config:
@@ -62,7 +59,7 @@ apps:
 
       # --- Embed Resolution Config ---
       enable_embed_resolution: true
-      gateway_artifact_content_limit_bytes: 10000000
+      gateway_max_artifact_resolve_size_bytes: 10000000
       gateway_recursive_embed_depth: 3
 
       # --- Authorization ---

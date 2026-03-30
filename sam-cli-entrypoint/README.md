@@ -1,6 +1,6 @@
-# SAM CLI Entrypoint Adapter
+# Solace Agent Mesh CLI Entrypoint
 
-A terminal-based entrypoint adapter for [Solace Agent Mesh](https://github.com/SolaceLabs/solace-agent-mesh). Chat with SAM agents directly from your command line.
+A terminal-based entrypoint for [Solace Agent Mesh](https://github.com/SolaceLabs/solace-agent-mesh). Chat with Solace Agent Mesh agents directly from your command line.
 
 ## Prerequisites
 
@@ -11,7 +11,7 @@ A terminal-based entrypoint adapter for [Solace Agent Mesh](https://github.com/S
 ## Installation
 
 ```bash
-# From within your SAM project's virtual environment
+# From within your Solace Agent Mesh project's virtual environment
 pip install -e .
 ```
 
@@ -27,7 +27,7 @@ Required environment variables:
 
 | Variable | Description | Default |
 |---|---|---|
-| `NAMESPACE` | SAM namespace | *(required)* |
+| `NAMESPACE` | Solace Agent Mesh namespace | *(required)* |
 | `SOLACE_BROKER_URL` | Solace broker WebSocket URL | `ws://localhost:8008` |
 | `SOLACE_BROKER_USERNAME` | Broker username | `default` |
 | `SOLACE_BROKER_PASSWORD` | Broker password | `default` |
@@ -58,7 +58,7 @@ CLI_ENTRYPOINT_ID=sam-cli-ep-02 sam run config.yaml  # second terminal
 - **Multi-session support** — create, name, switch between, and manage multiple concurrent sessions that persist across restarts
 - **File upload** to send local files to agents for analysis
 - **Artifact management** to list and download agent-created files (scoped per session)
-- **Feedback** to rate agent responses (published to SAM's feedback topic)
+- **Feedback** to rate agent responses (published to Solace Agent Mesh's feedback topic)
 - **Graceful exit** via `/quit` or Ctrl+D
 
 ## REPL Commands
@@ -69,9 +69,9 @@ CLI_ENTRYPOINT_ID=sam-cli-ep-02 sam run config.yaml  # second terminal
 |---|---|
 | `/new [label]` | Start a new session, optionally named |
 | `/sessions` | List all sessions with message counts and last active time |
-| `/switch <label\|id>` | Switch to an existing session (SAM reloads full history automatically) |
+| `/switch <label\|id>` | Switch to an existing session (Solace Agent Mesh reloads full history automatically) |
 | `/rename <label>` | Rename the current session |
-| `/delete <label\|id>` | Remove a session from the local index (conversation history and artifacts remain on SAM) |
+| `/delete <label\|id>` | Remove a session from the local index (conversation history and artifacts remain on Solace Agent Mesh) |
 
 ### General
 
@@ -87,14 +87,14 @@ CLI_ENTRYPOINT_ID=sam-cli-ep-02 sam run config.yaml  # second terminal
 
 ### How Sessions Work
 
-Sessions are identified by an internal `session_id` that scopes both conversation history and artifacts on SAM's side. The adapter maintains a local index (`~/.sam-cli-entrypoint/sessions.json`) that maps human-readable labels to session IDs and tracks metadata (message counts, timestamps).
+Sessions are identified by an internal `session_id` that scopes both conversation history and artifacts on Solace Agent Mesh's side. The entrypoint maintains a local index (`~/.sam-cli-entrypoint/sessions.json`) that maps human-readable labels to session IDs and tracks metadata (message counts, timestamps).
 
-- **SAM is the source of truth** for conversation history and artifacts. The local index only stores labels and stats.
-- **Switching sessions** changes the `session_id` passed to SAM. The agent automatically picks up the full history for that session — no manual reload needed.
-- **Deleting a session** removes it from the local index only. SAM has no entrypoint-facing API to delete server-side history.
-- **Sessions persist across restarts.** On launch, the adapter restores the last active session from the index.
+- **Solace Agent Mesh is the source of truth** for conversation history and artifacts. The local index only stores labels and stats.
+- **Switching sessions** changes the `session_id` passed to Solace Agent Mesh. The agent automatically picks up the full history for that session — no manual reload needed.
+- **Deleting a session** removes it from the local index only. Solace Agent Mesh has no entrypoint-facing API to delete server-side history.
+- **Sessions persist across restarts.** On launch, the entrypoint restores the last active session from the index.
 
-## Adapter Config Options
+## Config Options
 
 Configured under `adapter_config` in `config.yaml`:
 

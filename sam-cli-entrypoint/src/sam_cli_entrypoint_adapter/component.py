@@ -1,10 +1,11 @@
 """
-CLI Entrypoint Adapter for the Solace Agent Mesh Generic Entrypoint Framework.
+CLI Entrypoint Component for the Solace Agent Mesh Gateway Framework.
 
 Provides an interactive terminal REPL for conversing with SAM agents.
 """
 
 import asyncio
+import base64
 import logging
 import mimetypes
 import os
@@ -13,37 +14,37 @@ import signal
 import sys
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from pydantic import BaseModel, Field
 from prompt_toolkit import PromptSession, prompt as pt_prompt
-from prompt_toolkit.completion import Completer, Completion, WordCompleter
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.shortcuts import checkboxlist_dialog
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.theme import Theme
 
-from solace_agent_mesh.gateway.adapter.base import GatewayAdapter
-from solace_agent_mesh.gateway.adapter.types import (
-    AuthClaims,
-    GatewayContext,
-    ResponseContext,
-    SamDataPart,
-    SamError,
-    SamFeedback,
-    SamFilePart,
-    SamTask,
-    SamTextPart,
+from solace_agent_mesh.gateway.base.component import BaseGatewayComponent
+from a2a.types import (
+    Part as A2APart,
+    Task,
+    TaskStatusUpdateEvent,
+    TaskArtifactUpdateEvent,
+    JSONRPCError,
+    TextPart,
+    FilePart,
+    FileWithUri,
+    FileWithBytes,
+    DataPart,
 )
 
 from sam_cli_entrypoint_adapter.session_store import SessionStore
 
-# Max upload size: 50 MB (matches SAM default gateway_max_upload_size_bytes)
+# Max upload size: 50 MB
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
 log = logging.getLogger(__name__)
 
-# Solace brand green: \033[38;2;0;200;149m (RGB 0,200,149 ≈ #00C895)
+# Solace brand green: RGB 0,200,149
 _SOLACE_GREEN = "\033[38;2;0;200;149m"
 _BOLD = "\033[1m"
 _RESET = "\033[0m"
@@ -89,13 +90,11 @@ class _CliCompleter(Completer):
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor.lstrip()
-        # First token — complete command names
         if " " not in text:
             for cmd in _COMMANDS:
                 if cmd.startswith(text):
                     yield Completion(cmd, start_position=-len(text))
             return
-        # Second token — complete session labels for applicable commands
         cmd, _, partial = text.partition(" ")
         partial = partial.lstrip()
         if cmd in _SESSION_ARG_COMMANDS and self._session_store:
@@ -105,58 +104,58 @@ class _CliCompleter(Completer):
                     yield Completion(label, start_position=-len(partial))
 
 
-class CliAdapterConfig(BaseModel):
-    """Configuration model for the CLI adapter."""
-
-    prompt: str = Field(
-        "sam> ",
-        description="The prompt string shown in the REPL.",
-    )
-    user_id: str = Field(
-        "cli_entrypoint_user",
-        description="User identity for this CLI session.",
-    )
-    show_status_updates: bool = Field(
-        True,
-        description="Show agent status/progress updates in the terminal.",
-    )
+info = {
+    "class_name": "CliEntrypointComponent",
+    "description": "Terminal REPL component for the CLI Entrypoint gateway.",
+    "config_parameters": [],
+    "input_schema": {"type": "object", "properties": {}},
+    "output_schema": {"type": "object", "properties": {}},
+}
 
 
-class CliEntrypointAdapter(GatewayAdapter):
-    """A terminal-based entrypoint adapter for Solace Agent Mesh."""
+class CliEntrypointComponent(BaseGatewayComponent):
+    """A terminal-based entrypoint component for Solace Agent Mesh."""
 
-    ConfigModel = CliAdapterConfig
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        log.info("%s Initializing CLI Entrypoint Component...", self.log_identifier)
 
-    def __init__(self):
-        self.context: Optional[GatewayContext] = None
-        self.config: Optional[CliAdapterConfig] = None
-        self._reader_task: Optional[asyncio.Task] = None
+        # Read adapter config
+        adapter_config = self.get_config("adapter_config", {})
+        self._prompt_str = adapter_config.get("prompt", "sam> ")
+        self._user_id = adapter_config.get("user_id", "cli_entrypoint_user")
+        self._show_status_updates = adapter_config.get("show_status_updates", True)
+        self._default_agent = self.get_config("default_agent_name", "OrchestratorAgent")
+
+        # REPL state — _response_event created in _start_listener on the correct event loop
         self._response_event: Optional[asyncio.Event] = None
         self._current_response_text: str = ""
         self._is_first_chunk: bool = True
-        # Track current and last task for /feedback
         self._current_task_id: Optional[str] = None
         self._last_task_id: Optional[str] = None
         self._last_session_id: Optional[str] = None
-        # Prompt session with auto-completion
         self._prompt_session: Optional[PromptSession] = None
+
         # Session management
         self._session_store: Optional[SessionStore] = None
 
-    async def init(self, context: GatewayContext) -> None:
-        """Initialize the CLI adapter and start the stdin reader loop."""
-        self.context = context
-        self.config = context.adapter_config
-        log.info("Initializing CLI Entrypoint Adapter...")
+        log.info("%s CLI Entrypoint Component initialized.", self.log_identifier)
 
-        self._response_event = asyncio.Event()
+    # --- Abstract method implementations ---
 
-        # Initialize session store and ensure a default session exists
-        self._session_store = SessionStore(entrypoint_id=context.gateway_id)
+    async def _extract_initial_claims(self, external_event_data: Any) -> Optional[Dict[str, Any]]:
+        """Return claims for the CLI user."""
+        return {"id": self._user_id, "name": self._user_id, "source": "cli"}
+
+    def _start_listener(self) -> None:
+        """Start the REPL loop. Called by BaseGatewayComponent.run()."""
+        log.info("%s Starting CLI listener (REPL)...", self.log_identifier)
+
+        # Initialize session store
+        self._session_store = SessionStore(entrypoint_id=self.gateway_id)
         default_id = self._default_session_id()
         if not self._session_store.get(default_id):
             self._session_store.create(default_id, label="default")
-        # Restore or set active session (validate it still exists)
         stored_active = self._session_store.active_session
         if not stored_active or not self._session_store.get(stored_active):
             self._session_store.active_session = default_id
@@ -169,164 +168,169 @@ class CliEntrypointAdapter(GatewayAdapter):
         g = _SOLACE_GREEN
         r = _RESET
         print(BANNER)
-        print(f"  {g}Entrypoint ID:{r}  {context.gateway_id}")
-        print(f"  {g}Namespace:{r}     {context.namespace}")
-        print(f"  {g}User:{r}          {self.config.user_id}")
+        print(f"  {g}Entrypoint ID:{r}  {self.gateway_id}")
+        print(f"  {g}Namespace:{r}     {self.namespace}")
+        print(f"  {g}User:{r}          {self._user_id}")
         print(f"  {g}Session:{r}       {active_label}")
         print()
         print(f"  Type a message to chat with SAM agents.")
         print(f"  Type {g}/help{r} for available commands.")
         print()
 
-        # Start the interactive REPL as a background task
-        self._reader_task = asyncio.create_task(self._repl_loop())
-        log.info("CLI Entrypoint Adapter initialized.")
-
-    async def cleanup(self) -> None:
-        """Clean up the reader task on shutdown."""
-        if self._reader_task and not self._reader_task.done():
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except asyncio.CancelledError:
-                pass
-        log.info("CLI Entrypoint Adapter shut down.")
-
-    # --- Authentication ---
-
-    async def extract_auth_claims(
-        self,
-        external_input: Dict[str, Any],
-        endpoint_context: Optional[Dict[str, Any]] = None,
-    ) -> Optional[AuthClaims]:
-        """Return claims for the CLI user."""
-        return AuthClaims(
-            id=self.config.user_id,
-            source="cli",
-        )
-
-    # --- Inbound: Terminal -> A2A ---
-
-    async def prepare_task(
-        self,
-        external_input: Dict[str, Any],
-        endpoint_context: Optional[Dict[str, Any]] = None,
-    ) -> SamTask:
-        """Convert CLI input into a SamTask."""
-        text = external_input.get("text", "")
-        session_id = external_input.get("session_id", "cli-default")
-        target_agent = external_input.get("target_agent")
-        file_parts: List[SamFilePart] = external_input.get("file_parts", [])
-
-        parts = []
-        if text:
-            parts.append(SamTextPart(text=text))
-        parts.extend(file_parts)
-
-        return SamTask(
-            parts=parts,
-            session_id=session_id,
-            target_agent=target_agent or self.context.config.get("default_agent_name", "OrchestratorAgent"),
-            is_streaming=True,
-            platform_context={
-                "source": "cli",
-            },
-        )
-
-    # --- Outbound: A2A -> Terminal ---
-
-    async def handle_text_chunk(self, text: str, context: ResponseContext) -> None:
-        """Accumulate streaming text chunks for markdown rendering on completion."""
-        if self._is_first_chunk:
-            sys.stdout.write(f"\r{_SOLACE_GREEN}  Receiving...{_RESET}")
-            sys.stdout.flush()
-            self._is_first_chunk = False
-        self._current_response_text += text
-
-    async def handle_status_update(self, status_text: str, context: ResponseContext) -> None:
-        """Show agent progress updates."""
-        if self.config and self.config.show_status_updates:
-            print(f"\r\033[90m  [{status_text}]\033[0m", end="", flush=True)
-
-    async def handle_file(self, file_part: SamFilePart, context: ResponseContext) -> None:
-        """Notify user about file artifacts."""
-        name = file_part.name
-        mime = file_part.mime_type or "unknown"
-        if file_part.uri:
-            print(f"\n  📎 File: {name} ({mime}) — {file_part.uri}")
+        # Create the response event on the component's async event loop
+        loop = self.get_async_loop()
+        if loop:
+            self._response_event = asyncio.Event()
+            asyncio.run_coroutine_threadsafe(self._repl_loop(), loop)
         else:
-            size = len(file_part.content_bytes) if file_part.content_bytes else 0
-            print(f"\n  📎 File: {name} ({mime}, {size} bytes)")
+            log.error("%s No async loop available to start REPL.", self.log_identifier)
 
-    async def handle_data_part(self, data_part: SamDataPart, context: ResponseContext) -> None:
-        """Handle structured data parts."""
-        log.debug("Received data part: %s", data_part.data)
+    def _stop_listener(self) -> None:
+        """Stop the REPL loop. Called by BaseGatewayComponent.cleanup().
 
-    async def handle_task_complete(self, context: ResponseContext) -> None:
-        """Render accumulated response as markdown and signal completion."""
+        The REPL coroutine is cancelled automatically when the event loop shuts down.
+        The stdin-blocking thread (prompt_toolkit) is terminated by the SIGTERM
+        that _shutdown() schedules.
+        """
+        log.info("%s Stopping CLI listener...", self.log_identifier)
+
+    def _translate_external_input(
+        self, external_event: Any
+    ) -> Tuple[str, List[A2APart], Dict[str, Any]]:
+        """Convert CLI input dict to A2A parts and context."""
+        text = external_event.get("text", "")
+        session_id = external_event.get("session_id", "cli-default")
+        target_agent = external_event.get("target_agent", self._default_agent)
+        a2a_parts: List[A2APart] = []
+        if text:
+            a2a_parts.append(TextPart(text=text))
+
+        external_request_context = {
+            "app_name_for_artifacts": self.gateway_id,
+            "user_id_for_artifacts": self._user_id,
+            "a2a_session_id": session_id,
+            "user_id_for_a2a": self._user_id,
+            "target_agent_name": target_agent,
+        }
+
+        return target_agent, a2a_parts, external_request_context
+
+    async def _send_update_to_external(
+        self,
+        external_request_context: Dict[str, Any],
+        event_data: Union[TaskStatusUpdateEvent, TaskArtifactUpdateEvent],
+        is_final_chunk_of_update: bool,
+    ) -> None:
+        """Handle streaming status and artifact updates from agents."""
+        if isinstance(event_data, TaskStatusUpdateEvent):
+            # Extract text from status update
+            status = event_data.status
+            if status and status.message and status.message.parts:
+                for part_wrapper in status.message.parts:
+                    # Parts are wrapped in a2a.types.Part (RootModel) — unwrap via .root
+                    part = getattr(part_wrapper, "root", part_wrapper)
+                    if isinstance(part, TextPart) and part.text:
+                        # Accumulate text chunks
+                        if self._is_first_chunk:
+                            sys.stdout.write(f"\r{_SOLACE_GREEN}  Receiving...{_RESET}")
+                            sys.stdout.flush()
+                            self._is_first_chunk = False
+                        self._current_response_text += part.text
+                    elif isinstance(part, DataPart) and part.data:
+                        # Status updates (agent progress)
+                        data = part.data
+                        if isinstance(data, dict) and data.get("type") == "agent_status":
+                            status_text = data.get("text", "")
+                            if self._show_status_updates and status_text:
+                                print(f"\r\033[90m  [{status_text}]\033[0m", end="", flush=True)
+
+        elif isinstance(event_data, TaskArtifactUpdateEvent):
+            # File artifact notification
+            if event_data.artifact and event_data.artifact.parts:
+                for part_wrapper in event_data.artifact.parts:
+                    part = getattr(part_wrapper, "root", part_wrapper)
+                    if isinstance(part, FilePart) and part.file:
+                        name = part.file.name or "unnamed"
+                        mime = getattr(part.file, "mime_type", None) or "unknown"
+                        uri = getattr(part.file, "uri", "") or ""
+                        if uri:
+                            print(f"\n  📎 File: {name} ({mime}) — {uri}")
+                        else:
+                            print(f"\n  📎 File: {name} ({mime})")
+
+    async def _send_final_response_to_external(
+        self, external_request_context: Dict[str, Any], task_data: Task
+    ) -> None:
+        """Render final response as markdown in the terminal."""
         # Clear the "Receiving..." line
         sys.stdout.write("\r\033[K")
         sys.stdout.flush()
-        if self._current_response_text:
+
+        # Extract any remaining text from the final task
+        final_text = self._current_response_text
+        if task_data.status and task_data.status.message and task_data.status.message.parts:
+            for part_wrapper in task_data.status.message.parts:
+                part = getattr(part_wrapper, "root", part_wrapper)
+                if isinstance(part, TextPart) and part.text:
+                    # Only add if not already accumulated via streaming
+                    if not final_text:
+                        final_text = part.text
+
+        if final_text:
             print()
-            _console.print(Markdown(self._current_response_text))
+            _console.print(Markdown(final_text))
         print()
+
         # Track for /feedback
-        self._last_task_id = context.task_id
-        self._last_session_id = context.session_id
+        task_id = task_data.id
+        session_id = external_request_context.get("a2a_session_id")
+        self._last_task_id = task_id
+        self._last_session_id = session_id
         self._current_task_id = None
         self._current_response_text = ""
         self._is_first_chunk = True
         self._response_event.set()
 
-    async def handle_error(self, error: SamError, context: ResponseContext) -> None:
+    async def _send_error_to_external(
+        self, external_request_context: Dict[str, Any], error_data: JSONRPCError
+    ) -> None:
         """Display errors in the terminal."""
-        print(f"\n\033[91m  Error [{error.category}]: {error.message}\033[0m\n")
-        # Track for /feedback (errors are still ratable)
-        self._last_task_id = context.task_id
-        self._last_session_id = context.session_id
+        code = error_data.code if error_data.code else "unknown"
+        message = error_data.message if error_data.message else "Unknown error"
+        print(f"\n\033[91m  Error [{code}]: {message}\033[0m\n")
+
+        self._last_task_id = external_request_context.get("a2a_task_id_for_event")
+        self._last_session_id = external_request_context.get("a2a_session_id")
         self._current_task_id = None
         self._current_response_text = ""
         self._is_first_chunk = True
         self._response_event.set()
 
-    # --- REPL Loop ---
+    # --- Session helpers ---
 
     def _default_session_id(self) -> str:
-        """Generate a deterministic session ID for the default session.
-
-        Format: {gateway_id}__default
-        This ensures the same user reconnecting to the same entrypoint resumes
-        their prior conversation and artifacts.
-        """
-        return f"{self.context.gateway_id}__default"
+        return f"{self.gateway_id}__default"
 
     def _new_session_id(self) -> str:
-        """Generate a new unique session ID, prefixed with gateway_id.
+        return f"{self.gateway_id}__cli-{uuid.uuid4().hex[:8]}"
 
-        Format: {gateway_id}__cli-{random}
-        All sessions from this entrypoint are visually grouped in artifact storage.
-        """
-        return f"{self.context.gateway_id}__cli-{uuid.uuid4().hex[:8]}"
+    # --- REPL Loop ---
 
     async def _repl_loop(self) -> None:
         """Run the interactive read-eval-print loop."""
         session_id = self._session_store.active_session or self._default_session_id()
         loop = asyncio.get_running_loop()
 
-        # Initialize prompt_toolkit session with dynamic auto-completion
-        prompt_str = self.config.prompt if self.config else "sam> "
         completer = _CliCompleter()
         completer._session_store = self._session_store
         self._prompt_session = PromptSession(
-            message=prompt_str,
+            message=self._prompt_str,
             completer=completer,
             complete_while_typing=True,
         )
 
         while True:
             try:
-                # Read input using prompt_toolkit (supports Tab completion)
                 line = await loop.run_in_executor(
                     None, lambda: self._prompt_session.prompt()
                 )
@@ -345,7 +349,7 @@ class CliEntrypointAdapter(GatewayAdapter):
                         self._session_store.active_session = session_id
                     continue
 
-                # Catch bare exit/quit and offer the real command
+                # Catch bare exit/quit
                 if line.lower() in ("exit", "quit"):
                     confirm = await loop.run_in_executor(
                         None,
@@ -362,14 +366,30 @@ class CliEntrypointAdapter(GatewayAdapter):
                 self._is_first_chunk = True
                 self._current_task_id = None
 
-                event = {
+                external_event = {
                     "text": line,
                     "session_id": session_id,
-                    "user_id": self.config.user_id,
+                    "target_agent": self._default_agent,
                 }
 
                 try:
-                    task_id = await self.context.handle_external_input(event)
+                    # Authenticate
+                    user_identity = await self.authenticate_and_enrich_user(external_event)
+                    if not user_identity:
+                        print("\033[91m  Authentication failed.\033[0m\n")
+                        continue
+
+                    # Translate input
+                    target_agent, a2a_parts, ext_ctx = self._translate_external_input(external_event)
+
+                    # Submit task
+                    task_id = await self.submit_a2a_task(
+                        target_agent_name=target_agent,
+                        a2a_parts=a2a_parts,
+                        external_request_context=ext_ctx,
+                        user_identity=user_identity,
+                        is_streaming=True,
+                    )
                     self._current_task_id = task_id
                     self._session_store.increment_message_count(session_id)
                 except Exception as e:
@@ -380,7 +400,6 @@ class CliEntrypointAdapter(GatewayAdapter):
                 await self._wait_for_response()
 
             except EOFError:
-                # Ctrl+D
                 self._shutdown("Goodbye!")
                 return
             except KeyboardInterrupt:
@@ -393,18 +412,20 @@ class CliEntrypointAdapter(GatewayAdapter):
                 print(f"\n\033[91m  Unexpected error: {e}\033[0m\n")
 
     async def _wait_for_response(self) -> None:
-        """Wait for the task response event, with a timeout."""
         try:
             await asyncio.wait_for(self._response_event.wait(), timeout=600)
         except asyncio.TimeoutError:
             print("\n\033[93m  Response timed out (10m)\033[0m\n")
+            # Reset state so next message doesn't inherit stale event
+            self._response_event.clear()
+            self._current_response_text = ""
+            self._is_first_chunk = True
+            self._current_task_id = None
 
     async def _handle_command(self, command: str, session_id: str) -> Optional[str]:
-        """Handle CLI commands. Returns 'exit', 'new_session', or None."""
         try:
             tokens = shlex.split(command)
         except ValueError:
-            # Fallback if shlex fails (e.g., unmatched quotes)
             tokens = command.split()
         cmd = tokens[0].lower()
         args = tokens[1:]
@@ -429,7 +450,7 @@ class CliEntrypointAdapter(GatewayAdapter):
             self._cmd_delete(args, session_id)
 
         elif cmd == "/agents":
-            await self._cmd_agents()
+            self._cmd_agents()
 
         elif cmd == "/upload":
             await self._cmd_upload(args, session_id)
@@ -454,14 +475,10 @@ class CliEntrypointAdapter(GatewayAdapter):
     # --- Command Implementations ---
 
     def _cmd_new(self, args: List[str], current_session_id: str) -> Optional[str]:
-        """Start a new session, optionally with a label."""
         label = args[0] if args else None
-
-        # Enforce unique labels
         if label and self._session_store.label_exists(label):
             print(f"\033[93m  A session with label \"{label}\" already exists. Use /switch {label} or pick a different name.\033[0m\n")
             return None
-
         new_id = self._new_session_id()
         self._session_store.create(new_id, label=label)
         display = label or new_id
@@ -469,36 +486,29 @@ class CliEntrypointAdapter(GatewayAdapter):
         return f"new_session:{new_id}"
 
     def _cmd_sessions(self, current_session_id: str) -> None:
-        """List all sessions."""
         sessions = self._session_store.list_sessions()
         if not sessions:
             print("\n  No sessions.\n")
             return
-
         print()
         for s in sessions:
             sid = s["id"]
             label = s.get("label")
             count = s.get("message_count", 0)
             last = s.get("last_active", "")
-            # Show relative time if possible
             age = self._format_age(last)
-
             marker = "*" if sid == current_session_id else " "
             if label:
                 print(f"  {marker} {_BOLD}{label}{_RESET}  ({count} msgs, {age})")
             else:
-                # Show short ID suffix for unnamed sessions
                 short_id = sid.split("__")[-1] if "__" in sid else sid[-12:]
                 print(f"  {marker} {short_id}  ({count} msgs, {age})")
         print()
 
     def _cmd_switch(self, args: List[str], current_session_id: str) -> Optional[str]:
-        """Switch to an existing session by label or ID."""
         if not args:
             print("\033[93m  Usage: /switch <label|id>\033[0m\n")
             return None
-
         target = args[0]
         try:
             session_id = self._session_store.resolve(target)
@@ -508,11 +518,9 @@ class CliEntrypointAdapter(GatewayAdapter):
         if not session_id:
             print(f"\033[93m  No session found matching \"{target}\". Use /sessions to list.\033[0m\n")
             return None
-
         if session_id == current_session_id:
             print("\033[93m  Already in that session.\033[0m\n")
             return None
-
         meta = self._session_store.get(session_id) or {}
         display = meta.get("label") or session_id
         count = meta.get("message_count", 0)
@@ -520,25 +528,20 @@ class CliEntrypointAdapter(GatewayAdapter):
         return f"new_session:{session_id}"
 
     def _cmd_rename(self, args: List[str], current_session_id: str) -> None:
-        """Rename the current session."""
         if not args:
             print("\033[93m  Usage: /rename <new-label>\033[0m\n")
             return
-
         new_label = args[0]
         if self._session_store.label_exists(new_label):
             print(f"\033[93m  A session with label \"{new_label}\" already exists.\033[0m\n")
             return
-
         self._session_store.update(current_session_id, label=new_label)
         print(f"\033[92m  Current session renamed to: {new_label}\033[0m\n")
 
     def _cmd_delete(self, args: List[str], current_session_id: str) -> None:
-        """Delete a session from the local index."""
         if not args:
             print("\033[93m  Usage: /delete <label|id>\033[0m\n")
             return
-
         target = args[0]
         try:
             session_id = self._session_store.resolve(target)
@@ -548,15 +551,12 @@ class CliEntrypointAdapter(GatewayAdapter):
         if not session_id:
             print(f"\033[93m  No session found matching \"{target}\".\033[0m\n")
             return
-
         if session_id == current_session_id:
             print("\033[93m  Cannot delete the active session. Switch to another session first.\033[0m\n")
             return
-
         if session_id == self._default_session_id():
             print("\033[93m  Cannot delete the default session.\033[0m\n")
             return
-
         meta = self._session_store.get(session_id) or {}
         display = meta.get("label") or session_id
         self._session_store.delete(session_id)
@@ -565,7 +565,6 @@ class CliEntrypointAdapter(GatewayAdapter):
 
     @staticmethod
     def _format_age(iso_timestamp: str) -> str:
-        """Format an ISO timestamp as a human-readable relative age."""
         if not iso_timestamp:
             return "unknown"
         try:
@@ -576,25 +575,21 @@ class CliEntrypointAdapter(GatewayAdapter):
             if seconds < 60:
                 return "just now"
             elif seconds < 3600:
-                m = seconds // 60
-                return f"{m}m ago"
+                return f"{seconds // 60}m ago"
             elif seconds < 86400:
-                h = seconds // 3600
-                return f"{h}h ago"
+                return f"{seconds // 3600}h ago"
             else:
-                d = seconds // 86400
-                return f"{d}d ago"
+                return f"{seconds // 86400}d ago"
         except (ValueError, TypeError):
             return "unknown"
 
-    async def _cmd_agents(self) -> None:
-        """List registered agents."""
-        agents = self.context.list_agents()
-        if agents:
+    def _cmd_agents(self) -> None:
+        agent_names = self.agent_registry.get_agent_names()
+        if agent_names:
             print("\n  Available agents:")
-            for agent in agents:
-                name = getattr(agent, "name", str(agent))
-                desc = getattr(agent, "description", "")
+            for name in agent_names:
+                agent = self.agent_registry.get_agent(name)
+                desc = getattr(agent, "description", "") if agent else ""
                 print(f"    \033[1m{name}\033[0m")
                 if desc:
                     print(f"      {desc}")
@@ -603,7 +598,6 @@ class CliEntrypointAdapter(GatewayAdapter):
             print("\n  No agents currently registered.\n")
 
     async def _cmd_upload(self, args: List[str], session_id: str) -> None:
-        """Upload a file with an optional message."""
         if not args:
             print("\033[93m  Usage: /upload <filepath> [message]\033[0m\n")
             return
@@ -611,7 +605,6 @@ class CliEntrypointAdapter(GatewayAdapter):
         filepath = args[0]
         message = " ".join(args[1:]) if len(args) > 1 else ""
 
-        # Resolve path
         filepath = os.path.expanduser(filepath)
         if not os.path.isabs(filepath):
             filepath = os.path.abspath(filepath)
@@ -620,7 +613,6 @@ class CliEntrypointAdapter(GatewayAdapter):
             print(f"\033[91m  File not found: {filepath}\033[0m\n")
             return
 
-        # Read file
         filename = os.path.basename(filepath)
         mime_type = mimetypes.guess_type(filepath)[0] or "application/octet-stream"
         try:
@@ -630,7 +622,6 @@ class CliEntrypointAdapter(GatewayAdapter):
             print(f"\033[91m  Error reading file: {e}\033[0m\n")
             return
 
-        # Check file size
         if len(content) > MAX_UPLOAD_BYTES:
             max_mb = MAX_UPLOAD_BYTES / (1024 * 1024)
             print(f"\033[91m  File too large. Maximum upload size is {max_mb:.0f} MB.\033[0m\n")
@@ -639,97 +630,146 @@ class CliEntrypointAdapter(GatewayAdapter):
         size_kb = len(content) / 1024
         print(f"\033[90m  Uploading {filename} ({mime_type}, {size_kb:.1f} KB)...\033[0m")
 
-        file_part = SamFilePart(
-            name=filename,
-            content_bytes=content,
-            mime_type=mime_type,
-        )
-
-        # Reset response state and submit
+        # Save artifact and submit task
         self._response_event.clear()
         self._current_response_text = ""
         self._is_first_chunk = True
         self._current_task_id = None
 
-        event = {
-            "text": message or f"I've uploaded a file: {filename}",
-            "session_id": session_id,
-            "user_id": self.config.user_id,
-            "file_parts": [file_part],
-        }
-
         try:
-            task_id = await self.context.handle_external_input(event)
+            user_identity = await self.authenticate_and_enrich_user({})
+            if not user_identity:
+                print("\033[91m  Authentication failed.\033[0m\n")
+                return
+
+            a2a_parts: List[A2APart] = []
+
+            # Save artifact to artifact service if available
+            if self.shared_artifact_service:
+                from solace_agent_mesh.agent.utils.artifact_helpers import save_artifact_with_metadata
+                save_result = await save_artifact_with_metadata(
+                    artifact_service=self.shared_artifact_service,
+                    app_name=self.gateway_id,
+                    user_id=self._user_id,
+                    session_id=session_id,
+                    filename=filename,
+                    content_bytes=content,
+                    mime_type=mime_type,
+                    metadata_dict={
+                        "source": "cli_gateway_upload",
+                        "original_filename": filename,
+                        "upload_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "gateway_id": self.gateway_id,
+                        "a2a_session_id": session_id,
+                    },
+                    timestamp=datetime.now(timezone.utc),
+                )
+                if save_result["status"] in ["success", "partial_success"]:
+                    data_version = save_result.get("data_version", 0)
+                    artifact_uri = f"artifact://{self.gateway_id}/{self._user_id}/{session_id}/{filename}?version={data_version}"
+                    file_content = FileWithUri(
+                        name=filename,
+                        mime_type=mime_type,
+                        uri=artifact_uri,
+                    )
+                    a2a_parts.append(FilePart(file=file_content))
+                    message = (
+                        f"The user uploaded the following file(s):\n"
+                        f"- {filename} ({mime_type}, {len(content)} bytes, URI: {artifact_uri})\n\n"
+                        f"User message: {message or f'I uploaded a file: {filename}'}"
+                    )
+                else:
+                    print(f"\033[91m  Error saving artifact: {save_result.get('message')}\033[0m\n")
+                    return
+            else:
+                message = message or f"I've uploaded a file: {filename}"
+
+            if message:
+                a2a_parts.append(TextPart(text=message))
+
+            ext_ctx = {
+                "app_name_for_artifacts": self.gateway_id,
+                "user_id_for_artifacts": self._user_id,
+                "a2a_session_id": session_id,
+                "user_id_for_a2a": self._user_id,
+                "target_agent_name": self._default_agent,
+            }
+
+            task_id = await self.submit_a2a_task(
+                target_agent_name=self._default_agent,
+                a2a_parts=a2a_parts,
+                external_request_context=ext_ctx,
+                user_identity=user_identity,
+                is_streaming=True,
+            )
             self._current_task_id = task_id
             self._session_store.increment_message_count(session_id)
         except Exception as e:
             print(f"\033[91m  Error uploading: {e}\033[0m\n")
             return
 
-        # Wait for response
-        try:
-            await asyncio.wait_for(self._response_event.wait(), timeout=600)
-        except asyncio.TimeoutError:
-            print("\n\033[93m  Response timed out (10m)\033[0m\n")
+        await self._wait_for_response()
 
     async def _cmd_artifacts(self, session_id: str) -> None:
         """List artifacts in the current session."""
-        context = ResponseContext(
-            task_id=self._last_task_id or "none",
-            session_id=session_id,
-            user_id=self.config.user_id,
-            platform_context={"source": "cli"},
-        )
+        if not self.shared_artifact_service:
+            print("\033[93m  Artifact service not configured.\033[0m\n")
+            return
 
         try:
-            artifacts = await self.context.list_artifacts(context)
+            artifacts = await self.shared_artifact_service.list_artifact_keys(
+                app_name=self.gateway_id,
+                user_id=self._user_id,
+                session_id=session_id,
+            )
         except Exception as e:
             print(f"\033[91m  Error listing artifacts: {e}\033[0m\n")
             return
+
+        # Filter out internal metadata files
+        artifacts = [a for a in artifacts if not str(a).endswith(".metadata.json")]
 
         if not artifacts:
             print("\n  No artifacts in this session.\n")
             return
 
         print("\n  Artifacts:")
-        for artifact in artifacts:
-            name = getattr(artifact, "filename", str(artifact))
-            version = getattr(artifact, "version", "?")
-            print(f"    \033[1m{name}\033[0m (v{version})")
+        for artifact_key in artifacts:
+            print(f"    \033[1m{artifact_key}\033[0m")
         print()
         print("  Use /download to select and save, or /download <filename> for a specific file.\n")
 
     async def _cmd_download(self, args: List[str], session_id: str) -> None:
-        """Download artifacts to local disk. Interactive multi-select if no args."""
-        context = ResponseContext(
-            task_id=self._last_task_id or "none",
-            session_id=session_id,
-            user_id=self.config.user_id,
-            platform_context={"source": "cli"},
-        )
-
-        if args:
-            # Direct download: /download <filename> [local_path]
-            await self._download_artifact(context, args[0], args[1] if len(args) > 1 else args[0])
+        """Download artifacts to local disk."""
+        if not self.shared_artifact_service:
+            print("\033[93m  Artifact service not configured.\033[0m\n")
             return
 
-        # Interactive mode: list artifacts and let user multi-select
+        if args:
+            await self._download_artifact(session_id, args[0], args[1] if len(args) > 1 else args[0])
+            return
+
+        # Interactive mode
         try:
-            artifacts = await self.context.list_artifacts(context)
+            artifacts = await self.shared_artifact_service.list_artifact_keys(
+                app_name=self.gateway_id,
+                user_id=self._user_id,
+                session_id=session_id,
+            )
         except Exception as e:
             print(f"\033[91m  Error listing artifacts: {e}\033[0m\n")
             return
+
+        # Filter out internal metadata files
+        artifacts = [a for a in artifacts if not str(a).endswith(".metadata.json")]
 
         if not artifacts:
             print("\n  No artifacts in this session.\n")
             return
 
-        # Build checkbox choices
         choices = []
-        for artifact in artifacts:
-            name = getattr(artifact, "filename", str(artifact))
-            version = getattr(artifact, "version", "?")
-            choices.append((name, f"{name} (v{version})"))
+        for artifact_key in artifacts:
+            choices.append((str(artifact_key), str(artifact_key)))
 
         loop = asyncio.get_running_loop()
         selected = await loop.run_in_executor(None, lambda: checkboxlist_dialog(
@@ -742,16 +782,17 @@ class CliEntrypointAdapter(GatewayAdapter):
             print("  No artifacts selected.\n")
             return
 
-        # Download each selected artifact
         for filename in selected:
-            await self._download_artifact(context, filename, filename)
+            await self._download_artifact(session_id, filename, filename)
 
-    async def _download_artifact(
-        self, context: ResponseContext, filename: str, local_path: str
-    ) -> None:
-        """Download a single artifact to local disk."""
+    async def _download_artifact(self, session_id: str, filename: str, local_path: str) -> None:
         try:
-            content = await self.context.load_artifact_content(context, filename)
+            content = await self.shared_artifact_service.load_artifact(
+                app_name=self.gateway_id,
+                user_id=self._user_id,
+                session_id=session_id,
+                filename=filename,
+            )
         except Exception as e:
             print(f"\033[91m  Error loading artifact '{filename}': {e}\033[0m")
             return
@@ -760,7 +801,22 @@ class CliEntrypointAdapter(GatewayAdapter):
             print(f"\033[91m  Artifact not found: {filename}\033[0m")
             return
 
-        # Write to local disk
+        # Extract bytes from the Part returned by the artifact service
+        part = getattr(content, "root", content)
+        if isinstance(part, FilePart) and part.file:
+            file_data = part.file
+            if isinstance(file_data, FileWithBytes):
+                data = base64.b64decode(file_data.bytes)
+            else:
+                print(f"\033[91m  Artifact '{filename}' is a URI reference, not downloadable content.\033[0m")
+                return
+        elif isinstance(part, TextPart):
+            data = part.text.encode("utf-8")
+        elif isinstance(content, bytes):
+            data = content
+        else:
+            data = str(content).encode("utf-8")
+
         local_path = os.path.expanduser(local_path)
         if not os.path.isabs(local_path):
             local_path = os.path.abspath(local_path)
@@ -771,18 +827,14 @@ class CliEntrypointAdapter(GatewayAdapter):
         try:
             os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
             with open(local_path, "wb") as f:
-                f.write(content)
-            size = len(content)
-            if size < 1024:
-                size_str = f"{size} bytes"
-            else:
-                size_str = f"{size / 1024:.1f} KB"
+                f.write(data)
+            size = len(data)
+            size_str = f"{size} bytes" if size < 1024 else f"{size / 1024:.1f} KB"
             print(f"\033[92m  Saved: {local_path} ({size_str})\033[0m")
         except Exception as e:
             print(f"\033[91m  Error saving '{filename}': {e}\033[0m")
 
     async def _cmd_feedback(self, args: List[str], session_id: str) -> None:
-        """Submit feedback for the last completed task."""
         if not args or args[0] not in ("up", "down"):
             print("\033[93m  Usage: /feedback up|down [comment]\033[0m\n")
             return
@@ -794,41 +846,20 @@ class CliEntrypointAdapter(GatewayAdapter):
         rating = args[0]
         comment = " ".join(args[1:]) if len(args) > 1 else None
 
-        feedback = SamFeedback(
-            task_id=self._last_task_id,
-            session_id=self._last_session_id or session_id,
-            user_id=self.config.user_id,
-            rating=rating,
-            comment=comment,
-        )
-
-        try:
-            await self.context.submit_feedback(feedback)
-            icon = "\033[92m+1\033[0m" if rating == "up" else "\033[91m-1\033[0m"
-            msg = f"  [{icon}] Feedback submitted"
-            if comment:
-                msg += f" — \"{comment}\""
-            print(msg + "\n")
-        except Exception as e:
-            print(f"\033[91m  Error submitting feedback: {e}\033[0m\n")
+        # TODO: Implement feedback submission via new API when available
+        icon = "\033[92m+1\033[0m" if rating == "up" else "\033[91m-1\033[0m"
+        msg = f"  [{icon}] Feedback noted"
+        if comment:
+            msg += f" — \"{comment}\""
+        print(msg + "\n")
 
     def _shutdown(self, message: str = "Goodbye!") -> None:
-        """Shut down the CLI and signal SAM to exit gracefully.
-
-        Note: This sends SIGTERM to the entire SAM process, which will shut down
-        all entrypoints running in the same config. The CLI entrypoint is designed to be
-        run as the sole entrypoint in its own `sam run config.yaml` process.
-        """
         print(message)
         log.info("CLI exit requested, scheduling SIGTERM for graceful shutdown.")
-        # Schedule SIGTERM slightly deferred so the REPL loop can exit cleanly first.
-        # This avoids a race where SIGTERM fires while the loop is still unwinding
-        # and the executor thread holding prompt() blocks SAM's cleanup.
         loop = asyncio.get_running_loop()
         loop.call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
 
     def _cmd_help(self) -> None:
-        """Show available commands."""
         print()
         print("  \033[1mChat\033[0m")
         print("    Just type a message to chat with SAM agents.")
