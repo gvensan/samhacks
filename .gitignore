@@ -10,3 +10,5 @@ build/
 .sam/
 .claude/
 agents/
+inprogress/
+*/work/

@@ -1,5 +1,5 @@
 # Plugin Metadata:
-# Name: sam-cli-entrypoint-adapter
+# Name: cli-entrypoint
 # Version: 0.1.0
 # Description: Solace Agent Mesh CLI entrypoint adapter for terminal-based interaction
 # Author: SolaceLabs <solacelabs@solace.com>
@@ -13,7 +13,7 @@
 
 log:
   stdout_log_level: ERROR
-  log_file_level: DEBUG
+  log_file_level: ERROR
   log_file: logs/sam-cli-entrypoint.log
 
 # To use the `shared_config.yaml` file, uncomment the following line and remove the `shared_config` section below.
@@ -36,7 +36,7 @@ shared_config:
 
 apps:
   - name: sam_cli_entrypoint_app
-    app_module: sam_cli_entrypoint_adapter.app
+    app_module: cli_entrypoint.app
     broker:
       <<: *broker_connection
 
@@ -46,7 +46,7 @@ apps:
 
       # --- CLI Adapter-Specific Config ---
       adapter_config:
-        prompt: "sam> "
+        prompt_name: "sam"
         user_id: ${CLI_ENTRYPOINT_USER, cli_entrypoint_user}
         show_status_updates: true
 

@@ -6,6 +6,7 @@ Provides an interactive terminal REPL for conversing with SAM agents.
 
 import asyncio
 import base64
+import html as html_mod
 import logging
 import mimetypes
 import os
@@ -18,7 +19,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from prompt_toolkit import PromptSession, prompt as pt_prompt
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.shortcuts import checkboxlist_dialog
+from prompt_toolkit.styles import Style as PTStyle
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.theme import Theme
@@ -37,7 +40,7 @@ from a2a.types import (
     DataPart,
 )
 
-from sam_cli_entrypoint_adapter.session_store import SessionStore
+from cli_entrypoint.session_store import SessionStore
 
 # Max upload size: 50 MB
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -83,11 +86,15 @@ _COMMANDS = [
 _SESSION_ARG_COMMANDS = {"/switch", "/delete"}
 
 
+_MULTI_SELECT_SENTINEL = "--interactive-multi-select--"
+
+
 class _CliCompleter(Completer):
-    """Dynamic completer: command names first, then session labels for /switch and /delete."""
+    """Dynamic completer: command names first, then session labels or artifact names."""
 
     def __init__(self):
         self._session_store: Optional[SessionStore] = None
+        self._artifact_cache: List[str] = []
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor.lstrip()
@@ -103,6 +110,13 @@ class _CliCompleter(Completer):
                 label = session.get("label")
                 if label and label.startswith(partial):
                     yield Completion(label, start_position=-len(partial))
+        elif cmd == "/download" and self._artifact_cache:
+            # Offer multi-select as the first option
+            if _MULTI_SELECT_SENTINEL.startswith(partial) or not partial:
+                yield Completion(_MULTI_SELECT_SENTINEL, start_position=-len(partial))
+            for name in self._artifact_cache:
+                if name.startswith(partial):
+                    yield Completion(name, start_position=-len(partial))
 
 
 info = {
@@ -123,7 +137,7 @@ class CliEntrypointComponent(BaseGatewayComponent):
 
         # Read adapter config
         adapter_config = self.get_config("adapter_config", {})
-        self._prompt_str = adapter_config.get("prompt", "sam> ")
+        self._prompt_name = adapter_config.get("prompt_name", "sam")
         self._user_id = adapter_config.get("user_id", "cli_entrypoint_user")
         self._show_status_updates = adapter_config.get("show_status_updates", True)
         self._default_agent = self.get_config("default_agent_name", "OrchestratorAgent")
@@ -233,7 +247,7 @@ class CliEntrypointComponent(BaseGatewayComponent):
                     if isinstance(part, TextPart) and part.text:
                         # Accumulate text chunks
                         if self._is_first_chunk:
-                            sys.stdout.write(f"\r{_SOLACE_GREEN}  Receiving...{_RESET}")
+                            sys.stdout.write(f"\n{_SOLACE_GREEN}  Receiving...{_RESET}")
                             sys.stdout.flush()
                             self._is_first_chunk = False
                         self._current_response_text += part.text
@@ -295,6 +309,10 @@ class CliEntrypointComponent(BaseGatewayComponent):
         self._is_first_chunk = True
         self._response_event.set()
 
+        # Refresh artifact cache after each response (agent may have created artifacts)
+        if session_id:
+            await self._refresh_artifact_cache(session_id)
+
     async def _send_error_to_external(
         self, external_request_context: Dict[str, Any], error_data: JSONRPCError
     ) -> None:
@@ -320,6 +338,16 @@ class CliEntrypointComponent(BaseGatewayComponent):
 
     # --- REPL Loop ---
 
+    def _build_prompt(self, session_id: str) -> HTML:
+        """Build the prompt with the current session label or short ID."""
+        meta = (self._session_store.get(session_id) or {}) if self._session_store else {}
+        label = meta.get("label")
+        if not label:
+            label = session_id.split("__")[-1] if "__" in session_id else session_id[-12:]
+        safe_name = html_mod.escape(self._prompt_name)
+        safe_label = html_mod.escape(label)
+        return HTML('<style fg="#00C895" bold="true">{}</style> [{}]&gt; '.format(safe_name, safe_label))
+
     async def _repl_loop(self) -> None:
         """Run the interactive read-eval-print loop."""
         session_id = self._session_store.active_session or self._default_session_id()
@@ -327,16 +355,20 @@ class CliEntrypointComponent(BaseGatewayComponent):
 
         completer = _CliCompleter()
         completer._session_store = self._session_store
+        self._completer = completer
         self._prompt_session = PromptSession(
-            message=self._prompt_str,
             completer=completer,
             complete_while_typing=True,
         )
 
+        # Seed artifact cache for the initial session
+        await self._refresh_artifact_cache(session_id)
+
         while True:
             try:
+                current_prompt = self._build_prompt(session_id)
                 line = await loop.run_in_executor(
-                    None, lambda: self._prompt_session.prompt()
+                    None, lambda: self._prompt_session.prompt(current_prompt)
                 )
                 line = line.strip()
 
@@ -351,6 +383,7 @@ class CliEntrypointComponent(BaseGatewayComponent):
                     if isinstance(result, str) and result.startswith("new_session:"):
                         session_id = result.split(":", 1)[1]
                         self._session_store.active_session = session_id
+                        await self._refresh_artifact_cache(session_id)
                     continue
 
                 # Catch bare exit/quit
@@ -415,6 +448,22 @@ class CliEntrypointComponent(BaseGatewayComponent):
                 log.exception("Error in REPL loop: %s", e)
                 print(f"\n\033[91m  Unexpected error: {e}\033[0m\n")
 
+    async def _refresh_artifact_cache(self, session_id: str) -> None:
+        """Refresh the cached artifact list for tab completion."""
+        if not self.shared_artifact_service or not hasattr(self, "_completer"):
+            return
+        try:
+            artifacts = await self.shared_artifact_service.list_artifact_keys(
+                app_name=self.gateway_id,
+                user_id=self._user_id,
+                session_id=session_id,
+            )
+            self._completer._artifact_cache = [
+                str(a) for a in artifacts if not str(a).endswith(".metadata.json")
+            ]
+        except Exception as e:
+            log.debug("Failed to refresh artifact cache: %s", e)
+
     async def _wait_for_response(self) -> None:
         try:
             await asyncio.wait_for(self._response_event.wait(), timeout=600)
@@ -434,6 +483,15 @@ class CliEntrypointComponent(BaseGatewayComponent):
         cmd = tokens[0].lower()
         args = tokens[1:]
 
+        # Resolve short/prefix commands (e.g. /s -> /sessions, /sw -> /switch)
+        if cmd not in _COMMANDS:
+            matches = [c for c in _COMMANDS if c.startswith(cmd)]
+            if len(matches) == 1:
+                cmd = matches[0]
+            elif len(matches) > 1:
+                print(f"\033[93m  Ambiguous command: {cmd} (matches: {', '.join(matches)})\033[0m\n")
+                return None
+
         if cmd in ("/quit", "/exit", "/q"):
             self._shutdown("Goodbye!")
             return "exit"
@@ -442,10 +500,10 @@ class CliEntrypointComponent(BaseGatewayComponent):
             return self._cmd_new(args, session_id)
 
         elif cmd == "/sessions":
-            self._cmd_sessions(session_id)
+            await self._cmd_sessions(session_id)
 
         elif cmd == "/switch":
-            return self._cmd_switch(args, session_id)
+            return await self._cmd_switch(args, session_id)
 
         elif cmd == "/rename":
             self._cmd_rename(args, session_id)
@@ -461,6 +519,7 @@ class CliEntrypointComponent(BaseGatewayComponent):
 
         elif cmd == "/artifacts":
             await self._cmd_artifacts(session_id)
+            await self._refresh_artifact_cache(session_id)
 
         elif cmd == "/download":
             await self._cmd_download(args, session_id)
@@ -490,7 +549,7 @@ class CliEntrypointComponent(BaseGatewayComponent):
         print(f"\033[92m  New session started: {display}\033[0m\n")
         return f"new_session:{new_id}"
 
-    def _cmd_sessions(self, current_session_id: str) -> None:
+    async def _cmd_sessions(self, current_session_id: str) -> None:
         sessions = self._session_store.list_sessions()
         if not sessions:
             print("\n  No sessions.\n")
@@ -503,14 +562,29 @@ class CliEntrypointComponent(BaseGatewayComponent):
             last = s.get("last_active", "")
             age = self._format_age(last)
             marker = "*" if sid == current_session_id else " "
+            short_id = sid.split("__")[-1] if "__" in sid else sid[-12:]
+
+            # Get artifact count for this session
+            artifact_count = 0
+            if self.shared_artifact_service:
+                try:
+                    artifacts = await self.shared_artifact_service.list_artifact_keys(
+                        app_name=self.gateway_id,
+                        user_id=self._user_id,
+                        session_id=sid,
+                    )
+                    artifact_count = len([a for a in artifacts if not str(a).endswith(".metadata.json")])
+                except Exception:
+                    pass
+
+            stats = f"{count} msgs, {artifact_count} artifacts, {age}"
             if label:
-                print(f"  {marker} {_BOLD}{label}{_RESET}  ({count} msgs, {age})")
+                print(f"  {marker} {_BOLD}{label}{_RESET}  \033[90m[{short_id}]\033[0m  ({stats})")
             else:
-                short_id = sid.split("__")[-1] if "__" in sid else sid[-12:]
-                print(f"  {marker} {short_id}  ({count} msgs, {age})")
+                print(f"  {marker} {short_id}  ({stats})")
         print()
 
-    def _cmd_switch(self, args: List[str], current_session_id: str) -> Optional[str]:
+    async def _cmd_switch(self, args: List[str], current_session_id: str) -> Optional[str]:
         if not args:
             print("\033[93m  Usage: /switch <label|id>\033[0m\n")
             return None
@@ -529,7 +603,20 @@ class CliEntrypointComponent(BaseGatewayComponent):
         meta = self._session_store.get(session_id) or {}
         display = meta.get("label") or session_id
         count = meta.get("message_count", 0)
-        print(f"\033[92m  Switched to: {display} ({count} msgs)\033[0m\n")
+        age = self._format_age(meta.get("last_active", ""))
+        artifact_count = 0
+        if self.shared_artifact_service:
+            try:
+                artifacts = await self.shared_artifact_service.list_artifact_keys(
+                    app_name=self.gateway_id,
+                    user_id=self._user_id,
+                    session_id=session_id,
+                )
+                artifact_count = len([a for a in artifacts if not str(a).endswith(".metadata.json")])
+            except Exception:
+                pass
+        stats = f"{count} msgs, {artifact_count} artifacts, {age}"
+        print(f"\033[92m  Switched to: {display} ({stats})\033[0m\n")
         return f"new_session:{session_id}"
 
     def _cmd_rename(self, args: List[str], current_session_id: str) -> None:
@@ -739,10 +826,10 @@ class CliEntrypointComponent(BaseGatewayComponent):
             return
 
         print("\n  Artifacts:")
-        for artifact_key in artifacts:
-            print(f"    \033[1m{artifact_key}\033[0m")
+        for i, artifact_key in enumerate(artifacts, 1):
+            print(f"    {i}. \033[1m{artifact_key}\033[0m")
         print()
-        print("  Use /download to select and save, or /download <filename> for a specific file.\n")
+        print("  Use /download to select and save, or /download <artifact> for a specific file.\n")
 
     async def _cmd_download(self, args: List[str], session_id: str) -> None:
         """Download artifacts to local disk."""
@@ -750,7 +837,7 @@ class CliEntrypointComponent(BaseGatewayComponent):
             print("\033[93m  Artifact service not configured.\033[0m\n")
             return
 
-        if args:
+        if args and args[0] != _MULTI_SELECT_SENTINEL:
             await self._download_artifact(session_id, args[0], args[1] if len(args) > 1 else args[0])
             return
 
@@ -776,11 +863,20 @@ class CliEntrypointComponent(BaseGatewayComponent):
         for artifact_key in artifacts:
             choices.append((str(artifact_key), str(artifact_key)))
 
+        _dialog_style = PTStyle.from_dict({
+            "dialog.body checkbox-list":           "bg:#093B5F #ffffff",
+            "dialog.body checkbox-list checkbox":  "#ffffff",
+            "dialog.body checkbox-list checkbox focused": "bg:#00C895 #000000 bold",
+            "dialog.body checkbox-list checkbox checked": "#00C895 bold",
+            "dialog.body checkbox-list checkbox checked focused": "bg:#00C895 #000000 bold",
+        })
+
         loop = asyncio.get_running_loop()
         selected = await loop.run_in_executor(None, lambda: checkboxlist_dialog(
             title="Download Artifacts",
             text="Select artifacts to download (Space to toggle, Enter to confirm):",
             values=choices,
+            style=_dialog_style,
         ).run())
 
         if not selected:
@@ -806,21 +902,27 @@ class CliEntrypointComponent(BaseGatewayComponent):
             print(f"\033[91m  Artifact not found: {filename}\033[0m")
             return
 
-        # Extract bytes from the Part returned by the artifact service
-        part = getattr(content, "root", content)
-        if isinstance(part, FilePart) and part.file:
-            file_data = part.file
-            if isinstance(file_data, FileWithBytes):
-                data = base64.b64decode(file_data.bytes)
-            else:
-                print(f"\033[91m  Artifact '{filename}' is a URI reference, not downloadable content.\033[0m")
-                return
-        elif isinstance(part, TextPart):
-            data = part.text.encode("utf-8")
+        # Extract bytes from the Part returned by the artifact service.
+        # load_artifact returns an adk_types.Part with inline_data (data + mime_type).
+        inline_data = getattr(content, "inline_data", None)
+        if inline_data is not None and hasattr(inline_data, "data"):
+            data = inline_data.data if isinstance(inline_data.data, bytes) else str(inline_data.data).encode("utf-8")
         elif isinstance(content, bytes):
             data = content
         else:
-            data = str(content).encode("utf-8")
+            # Fallback for A2A part types
+            part = getattr(content, "root", content)
+            if isinstance(part, FilePart) and part.file:
+                file_data = part.file
+                if isinstance(file_data, FileWithBytes):
+                    data = base64.b64decode(file_data.bytes)
+                else:
+                    print(f"\033[91m  Artifact '{filename}' is a URI reference, not downloadable content.\033[0m")
+                    return
+            elif isinstance(part, TextPart):
+                data = part.text.encode("utf-8")
+            else:
+                data = str(content).encode("utf-8")
 
         local_path = os.path.expanduser(local_path)
         if not os.path.isabs(local_path):
@@ -880,7 +982,7 @@ class CliEntrypointComponent(BaseGatewayComponent):
         print("    /agents                     — List registered agents")
         print("    /upload <file> [message]    — Send a file to an agent")
         print("    /artifacts                  — List agent-created files in this session")
-        print("    /download [file] [path]     — Save artifacts (interactive if no file given)")
+        print("    /download [artifact] [path] — Save artifacts (interactive if no artifact given)")
         print("    /help                       — Show this help message")
         print("    /quit                       — Exit the CLI")
         print()

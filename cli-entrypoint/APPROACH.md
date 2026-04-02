@@ -142,7 +142,7 @@ We don't manage any of these directly. The Solace Agent Mesh framework subscribe
 |---|---|---|
 | Language | Python 3.10+ | Solace Agent Mesh entrypoint framework requirement |
 | Framework | `solace-agent-mesh` | Entrypoint base classes, broker comms, A2A protocol |
-| Terminal UI | `prompt_toolkit` | REPL with Tab auto-completion for slash commands |
+| Terminal UI | `prompt_toolkit` | REPL with Tab auto-completion for commands, session labels, and artifact names |
 | Rendering | `rich` | Markdown rendering with Solace-themed styling |
 | Config validation | Pydantic | Adapter config via `get_config()` |
 | Config format | YAML | Standard Solace Agent Mesh plugin config |
